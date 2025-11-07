@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Opera GX — Vite (debug)",
+      "type": "pwa-chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}",
+      "runtimeExecutable": "C:\\Users\\tapio\\AppData\\Local\\Programs\\Opera GX\\opera.exe",
+      "runtimeArgs": [
+        "--user-data-dir=${workspaceFolder}\\.vscode\\opera-gx-profile",
+        "--no-default-browser-check",
+        "--no-first-run"
+      ],
+      "breakOnLoad": false,
+      "trace": true
+    },
+    {
+      "name": "Run Vite dev server only",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
