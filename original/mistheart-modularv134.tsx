@@ -404,9 +404,13 @@ const GAME_CONSTANTS = {
   GOLD_PER_ENEMY_BASE: 10,
   GOLD_MULTIPLIER_RANGE: [0.8, 1.5],
   
+  // Item Drop System
+  ITEM_DROP_CHANCE: 0.3, // 30% chance to drop item
+  
   // Save System
   SAVE_SLOT_KEY: 'mistheart_save_slot_',
-  MAX_SAVE_SLOTS: 3
+  MAX_SAVE_SLOTS: 3,
+  SAVE_VERSION: '1.0.1' // Increment when save structure changes
 };
 
 // =============================================================================
@@ -725,7 +729,11 @@ const ENEMY_TEMPLATES = [
     strength: 12,
     color: '#FF0000',
     actions: ['slam', 'gravePoison'],
-    goldDrop: 15
+    goldDrop: 15,
+    itemDrops: [
+      { itemId: 'healthPotion', chance: 0.3 },
+      { itemId: 'antidote', chance: 0.2 }
+    ]
   },
   {
     id: 'mistling',
@@ -735,7 +743,11 @@ const ENEMY_TEMPLATES = [
     strength: 8,
     color: '#E879F9',
     actions: ['scratch', 'shadowBolt'],
-    goldDrop: 10
+    goldDrop: 10,
+    itemDrops: [
+      { itemId: 'manaPotion', chance: 0.25 },
+      { itemId: 'healthPotion', chance: 0.15 }
+    ]
   }
 ];
 
@@ -860,7 +872,7 @@ class SaveSystem {
   static saveGame(state, slotNumber = 1) {
     try {
       const saveData = {
-        version: '1.0.0',
+        version: GAME_CONSTANTS.SAVE_VERSION,
         timestamp: Date.now(),
         roster: state.roster,
         inventory: state.inventory,
@@ -869,9 +881,10 @@ class SaveSystem {
           currentBiome: state.worldMap.currentBiome,
           camera: state.worldMap.camera,
           locations: state.worldMap.locations,
-          // Don't save the full map, regenerate on load
         },
-        playTime: state.playTime || 0
+        playTime: state.playTime || 0,
+        gameScale: state.gameScale || GAME_CONSTANTS.DEFAULT_SCALE,
+        fullscreen: state.fullscreen || false
       };
       
       const saveKey = GAME_CONSTANTS.SAVE_SLOT_KEY + slotNumber;
@@ -896,11 +909,56 @@ class SaveSystem {
       }
       
       const saveData = JSON.parse(saveDataStr);
+      
+      // Migrate old save files
+      this.migrateSave(saveData);
+      
       console.log(`Game loaded from slot ${slotNumber}!`);
       return saveData;
     } catch (error) {
       console.error('Load failed:', error);
       return null;
+    }
+  }
+  
+  static migrateSave(saveData) {
+    // Migrate old saves to new version
+    if (!saveData.version || saveData.version < GAME_CONSTANTS.SAVE_VERSION) {
+      console.log('Migrating old save file...');
+      
+      // Fix heroes without skills/traits
+      saveData.roster.allHeroes.forEach(hero => {
+        // Ensure arrays exist
+        if (!hero.traits) hero.traits = [];
+        if (!hero.skills) hero.skills = [];
+        if (!hero.equipment) hero.equipment = { weapon: null, armor: null, accessory: null };
+        
+        // Retroactively unlock skills based on level
+        EquipmentSystem.unlockSkills(hero);
+        
+        // Ensure stats are correct for level
+        // (This ensures heroes have proper stats even if they leveled up in old version)
+      });
+      
+      // Ensure inventory has item counts
+      if (!saveData.inventory.items) {
+        saveData.inventory.items = {
+          healthPotion: 3,
+          manaPotion: 2
+        };
+      }
+      
+      // Add missing fields
+      if (!saveData.gameScale) {
+        saveData.gameScale = GAME_CONSTANTS.DEFAULT_SCALE;
+      }
+      
+      if (!saveData.fullscreen) {
+        saveData.fullscreen = false;
+      }
+      
+      saveData.version = GAME_CONSTANTS.SAVE_VERSION;
+      console.log('Save migration complete!');
     }
   }
   
@@ -1025,6 +1083,8 @@ class GameStateManager {
     this.state.worldMap.camera = saveData.worldMap.camera;
     this.state.worldMap.locations = saveData.worldMap.locations;
     this.state.playTime = saveData.playTime || 0;
+    this.state.gameScale = saveData.gameScale || GAME_CONSTANTS.DEFAULT_SCALE;
+    this.state.fullscreen = saveData.fullscreen || false;
     this.state.scene = 'WORLD_MAP';
     
     // Regenerate map (don't save/load the huge map array)
@@ -1410,12 +1470,17 @@ class EquipmentSystem {
   
   static unlockSkills(hero) {
     const available = this.getAvailableSkills(hero);
+    const newSkills = [];
+    
     available.forEach(skillId => {
       if (!hero.skills.includes(skillId)) {
         hero.skills.push(skillId);
+        newSkills.push(skillId);
         console.log(`${hero.name} unlocked skill: ${SKILL_DATABASE[skillId].name}!`);
       }
     });
+    
+    return newSkills;
   }
 }
 
@@ -1449,7 +1514,7 @@ class XPSystem {
       hero.xpToNext = Math.floor(GAME_CONSTANTS.XP_TO_LEVEL * Math.pow(1.2, hero.level - 1));
       
       // Unlock new skills based on level
-      EquipmentSystem.unlockSkills(hero);
+      const newSkills = EquipmentSystem.unlockSkills(hero);
       
       // Generate 2 random trait options
       const traitOptions = this.generateTraitOptions(hero);
@@ -1458,7 +1523,8 @@ class XPSystem {
         hero: hero,
         level: hero.level,
         gains: statGains,
-        traitOptions: traitOptions
+        traitOptions: traitOptions,
+        newSkills: newSkills // Include unlocked skills
       });
     }
     
@@ -1588,6 +1654,8 @@ class CombatSystem {
       actionQueue: [],
       floatingTexts: [],
       levelUpNotifications: [], // Store level up messages
+      skillUnlockNotifications: [], // Store skill unlock messages
+      itemDropNotifications: [], // Store item drop messages
       traitSelection: null, // {heroIndex, traitOptions: [id1, id2]}
       goldEarned: 0, // Track gold from this battle
       
@@ -1610,6 +1678,16 @@ class CombatSystem {
     
     // Update level up notifications
     combat.levelUpNotifications = combat.levelUpNotifications
+      .map(n => ({ ...n, duration: n.duration - 1 }))
+      .filter(n => n.duration > 0);
+    
+    // Update skill unlock notifications
+    combat.skillUnlockNotifications = combat.skillUnlockNotifications
+      .map(n => ({ ...n, duration: n.duration - 1 }))
+      .filter(n => n.duration > 0);
+    
+    // Update item drop notifications
+    combat.itemDropNotifications = combat.itemDropNotifications
       .map(n => ({ ...n, duration: n.duration - 1 }))
       .filter(n => n.duration > 0);
     
@@ -1793,8 +1871,8 @@ class CombatSystem {
     
     // Consume item if it's consumable
     if (actionDef.consumable && casterType === 'hero') {
-      // Note: Inventory consumption would happen here
-      // For now, we'll allow unlimited use in battle
+      // Note: Will be tracked in inventory properly now
+      // Decrement item count (handled after battle in endBattle)
     }
     
     // Calculate effect
@@ -1840,6 +1918,22 @@ class CombatSystem {
           const goldAmount = Math.floor(target.goldDrop * goldMultiplier);
           combat.goldEarned += goldAmount;
           this.addFloatingText(combat, `+${goldAmount}G`, targetType, targetIndex, '#FFD700');
+          
+          // Check for item drops
+          if (target.itemDrops && Math.random() < GAME_CONSTANTS.ITEM_DROP_CHANCE) {
+            target.itemDrops.forEach(drop => {
+              if (Math.random() < drop.chance) {
+                const item = ITEM_DATABASE[drop.itemId];
+                if (item) {
+                  combat.itemDropNotifications.push({
+                    itemName: item.name,
+                    duration: 180
+                  });
+                  console.log(`${target.name} dropped ${item.name}!`);
+                }
+              }
+            });
+          }
         }
         
         // Award XP and check for level up
@@ -1848,13 +1942,26 @@ class CombatSystem {
         // Show XP gain
         this.addFloatingText(combat, `+${finalXP}XP`, casterType, casterIndex, '#FFD700');
         
-        // Handle level ups with trait selection
+        // Handle level ups with trait selection and skill unlocks
         levelUps.forEach(levelUp => {
           combat.levelUpNotifications.push({
             heroName: levelUp.hero.name,
             level: levelUp.level,
             duration: 180 // 3 seconds
           });
+          
+          // Show skill unlock notifications
+          if (levelUp.newSkills && levelUp.newSkills.length > 0) {
+            levelUp.newSkills.forEach(skillId => {
+              const skill = SKILL_DATABASE[skillId];
+              combat.skillUnlockNotifications.push({
+                heroName: levelUp.hero.name,
+                skillName: skill.name,
+                description: skill.description,
+                duration: 240 // 4 seconds
+              });
+            });
+          }
           
           // If there are trait options, pause for selection
           if (levelUp.traitOptions && levelUp.traitOptions.length >= 2) {
@@ -2096,10 +2203,11 @@ class WorldMapController {
     
     // Quick save (F5 key)
     if (input.isPressed('f5')) {
-      const saved = SaveSystem.saveGame(state, 1);
+      const slotNumber = state.quickSaveSlot || 1;
+      const saved = SaveSystem.saveGame(state, slotNumber);
       if (saved) {
         state.saveMessage = {
-          text: 'Quick Saved!',
+          text: `Quick Saved (Slot ${slotNumber})!`,
           duration: 120
         };
       }
@@ -2289,7 +2397,7 @@ class PartyMenuController {
 // MODULE 10: SETTINGS MENU CONTROLLER
 // =============================================================================
 class SettingsMenuController {
-  static handleInput(state, input, onScaleChange) {
+  static handleInput(state, input, onScaleChange, onFullscreenChange) {
     const { settings } = state;
     
     if (input.isPressed('escape')) {
@@ -2297,7 +2405,7 @@ class SettingsMenuController {
       return;
     }
     
-    const options = ['Scale', 'Save Game', 'Return to Title', 'Resume'];
+    const options = ['Scale', 'Fullscreen', 'Save Game', 'Return to Title', 'Resume'];
     
     if (input.isPressed('arrowup') || input.isPressed('w')) {
       settings.cursor = Math.max(0, settings.cursor - 1);
@@ -2321,15 +2429,17 @@ class SettingsMenuController {
       }
     } else if (input.isPressed('enter')) {
       if (settings.cursor === 1) {
-        // Save Game
-        const saved = SaveSystem.saveGame(state, 1);
-        if (saved) {
-          state.saveMessage = { text: 'Game Saved!', duration: 120 };
-        }
+        // Toggle Fullscreen
+        state.fullscreen = !state.fullscreen;
+        if (onFullscreenChange) onFullscreenChange(state.fullscreen);
       } else if (settings.cursor === 2) {
+        // Save Game - show slot selection
+        state.scene = 'SAVE_SELECT';
+        state.saveSelect = { cursor: 0 };
+      } else if (settings.cursor === 3) {
         // Return to Title
         state.scene = 'TITLE_SCREEN';
-      } else if (settings.cursor === 3) {
+      } else if (settings.cursor === 4) {
         // Resume
         state.scene = 'WORLD_MAP';
       }
@@ -2338,7 +2448,35 @@ class SettingsMenuController {
 }
 
 // =============================================================================
-// MODULE 11: INVENTORY CONTROLLER
+// MODULE 11: SAVE SELECT CONTROLLER
+// =============================================================================
+class SaveSelectController {
+  static handleInput(state, input) {
+    const { saveSelect } = state;
+    
+    if (input.isPressed('escape')) {
+      state.scene = 'SETTINGS';
+      return;
+    }
+    
+    if (input.isPressed('arrowup') || input.isPressed('w')) {
+      saveSelect.cursor = Math.max(0, saveSelect.cursor - 1);
+    } else if (input.isPressed('arrowdown') || input.isPressed('s')) {
+      saveSelect.cursor = Math.min(GAME_CONSTANTS.MAX_SAVE_SLOTS - 1, saveSelect.cursor + 1);
+    } else if (input.isPressed('enter')) {
+      const slotNumber = saveSelect.cursor + 1;
+      const saved = SaveSystem.saveGame(state, slotNumber);
+      if (saved) {
+        state.saveMessage = { text: `Saved to Slot ${slotNumber}!`, duration: 120 };
+        state.quickSaveSlot = slotNumber; // Update quick save slot
+        state.scene = 'SETTINGS';
+      }
+    }
+  }
+}
+
+// =============================================================================
+// MODULE 12: INVENTORY CONTROLLER
 // =============================================================================
 class InventoryController {
   static handleInput(state, input) {
@@ -2597,7 +2735,7 @@ class Renderer {
     ctx.font = '16px monospace';
     ctx.fillText('SETTINGS', GAME_CONSTANTS.CANVAS_WIDTH / 2 - 40, 30);
     
-    const options = ['Scale', 'Save Game', 'Return to Title', 'Resume'];
+    const options = ['Scale', 'Fullscreen', 'Save Game', 'Return to Title', 'Resume'];
     const startY = 70;
     
     options.forEach((option, i) => {
@@ -2615,6 +2753,9 @@ class Renderer {
       if (option === 'Scale') {
         const resolution = `${GAME_CONSTANTS.CANVAS_WIDTH * settings.scale}x${GAME_CONSTANTS.CANVAS_HEIGHT * settings.scale}`;
         ctx.fillText(`${option}: < ${resolution} >`, 40, y);
+      } else if (option === 'Fullscreen') {
+        const status = state.fullscreen ? '[X]' : '[ ]';
+        ctx.fillText(`${option}: ${status}`, 40, y);
       } else {
         ctx.fillText(option, 40, y);
       }
@@ -2625,6 +2766,53 @@ class Renderer {
     ctx.font = '10px monospace';
     ctx.fillText('Arrow Keys: Navigate | Enter: Select | Esc: Resume', 30, GAME_CONSTANTS.CANVAS_HEIGHT - 20);
     ctx.fillText('F5: Quick Save', 30, GAME_CONSTANTS.CANVAS_HEIGHT - 35);
+  }
+  
+  static drawSaveSelect(ctx, state) {
+    const { saveSelect } = state;
+    
+    // Semi-transparent background
+    ctx.fillStyle = 'rgba(26, 26, 46, 0.95)';
+    ctx.fillRect(0, 0, GAME_CONSTANTS.CANVAS_WIDTH, GAME_CONSTANTS.CANVAS_HEIGHT);
+    
+    // Title
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '14px monospace';
+    ctx.fillText('SELECT SAVE SLOT', GAME_CONSTANTS.CANVAS_WIDTH / 2 - 70, 30);
+    
+    const saveSlots = SaveSystem.getAllSaveSlots();
+    const startY = 60;
+    
+    saveSlots.forEach((slot, i) => {
+      const y = startY + (i * 50);
+      
+      if (i === saveSelect.cursor) {
+        ctx.fillStyle = 'rgba(250, 204, 21, 0.2)';
+        ctx.fillRect(20, y - 12, GAME_CONSTANTS.CANVAS_WIDTH - 40, 48);
+      }
+      
+      ctx.fillStyle = i === saveSelect.cursor ? '#FACC15' : '#FFFFFF';
+      ctx.font = '11px monospace';
+      
+      if (slot) {
+        const date = new Date(slot.timestamp);
+        const timeStr = date.toLocaleString();
+        
+        ctx.fillText(`Slot ${i + 1}: ${slot.activeParty.map(p => `${p.name}(${p.level})`).join(', ')}`, 25, y);
+        ctx.font = '9px monospace';
+        ctx.fillStyle = '#AAAAAA';
+        ctx.fillText(`Gold: ${slot.gold}`, 25, y + 15);
+        ctx.fillText(timeStr, 25, y + 27);
+        ctx.fillText('[OVERWRITE]', 25, y + 39);
+      } else {
+        ctx.fillText(`Slot ${i + 1}: [Empty]`, 25, y);
+      }
+    });
+    
+    // Instructions
+    ctx.fillStyle = '#AAAAAA';
+    ctx.font = '10px monospace';
+    ctx.fillText('Arrow Keys: Select Slot | Enter: Save | Esc: Cancel', 20, GAME_CONSTANTS.CANVAS_HEIGHT - 20);
   }
   
   static drawPartyMenu(ctx, state) {
@@ -3169,6 +3357,38 @@ class Renderer {
       ctx.fillText(text, GAME_CONSTANTS.CANVAS_WIDTH / 2 - 60, y);
     });
     
+    // Draw skill unlock notifications
+    combat.skillUnlockNotifications.forEach((notif, i) => {
+      const y = 50 + (i * 30);
+      const alpha = Math.min(1, notif.duration / 80);
+      
+      ctx.fillStyle = `rgba(16, 185, 129, ${alpha})`;
+      ctx.font = '9px monospace';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 2;
+      const text = `${notif.heroName} learned ${notif.skillName}!`;
+      ctx.strokeText(text, GAME_CONSTANTS.CANVAS_WIDTH / 2 - 80, y);
+      ctx.fillText(text, GAME_CONSTANTS.CANVAS_WIDTH / 2 - 80, y);
+      
+      ctx.fillStyle = `rgba(170, 170, 170, ${alpha})`;
+      ctx.font = '7px monospace';
+      ctx.fillText(notif.description, GAME_CONSTANTS.CANVAS_WIDTH / 2 - 80, y + 10);
+    });
+    
+    // Draw item drop notifications
+    combat.itemDropNotifications.forEach((notif, i) => {
+      const y = 80 + (i * 15);
+      const alpha = Math.min(1, notif.duration / 60);
+      
+      ctx.fillStyle = `rgba(147, 51, 234, ${alpha})`;
+      ctx.font = '9px monospace';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 2;
+      const text = `Found: ${notif.itemName}`;
+      ctx.strokeText(text, GAME_CONSTANTS.CANVAS_WIDTH / 2 - 40, y);
+      ctx.fillText(text, GAME_CONSTANTS.CANVAS_WIDTH / 2 - 40, y);
+    });
+    
     // Draw UI panel
     const uiY = GAME_CONSTANTS.CANVAS_HEIGHT - 55;
     ctx.fillStyle = 'rgba(26, 26, 46, 0.9)';
@@ -3404,6 +3624,19 @@ export default function MistheartSpire() {
   
   const handleScaleChange = (newScale) => {
     setScale(newScale);
+  };
+  
+  const handleFullscreenChange = (isFullscreen) => {
+    if (isFullscreen) {
+      const elem = document.documentElement;
+      if (elem.requestFullscreen) {
+        elem.requestFullscreen();
+      }
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+    }
   };
   
   useEffect(() => {
